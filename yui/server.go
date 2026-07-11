@@ -29,11 +29,33 @@ type Request struct {
 	Host    string
 	Headers map[string]string
 	Body    string
+	conn    *net.Conn
 }
+
+// TODO: Setup Custom Status Code Type
+
+const (
+	StatusOk                  Statuscode = 200
+	StatusBadRequest          Statuscode = 400
+	StatusNotFound            Statuscode = 404
+	StatusRequestTimeout      Statuscode = 408
+	StatusLengthRequired      Statuscode = 411
+	StatusPayloadTooLarge     Statuscode = 413
+	StatusTooManyRequests     Statuscode = 429
+	StatusInternalServerError Statuscode = 500
+	StatusNotImplemented      Statuscode = 501
+	StatusBadGateway          Statuscode = 502
+	StatusServiceUnavailable  Statuscode = 503
+	StatusGatewayTimeout      Statuscode = 504
+)
+
+type Statuscode int
 
 type Response struct {
 	headers map[string]string
+	status  string
 	body    string
+	conn    *net.Conn
 }
 
 // Maps verb:path -> function defined by the user
@@ -51,9 +73,76 @@ func newListener(addr string) net.Listener {
 	return listener
 }
 
-func (s *Response) Send(message string)         {}
-func (s *Response) Setheader(key, value string) {}
-func (s *Response) Setbody(message string)      {}
+func (s *Response) buildHeader() string {
+	return ""
+}
+
+func (s *Response) buildBody() string {
+	return ""
+}
+
+func (s *Response) statusCodeToString() string {
+	switch s.status {
+	case "200":
+		return "OK"
+	case "400":
+		return "Bad Request"
+	case "404":
+		return "Not Found"
+	case "408":
+		return "Request Timeout"
+	case "411":
+		return "Length Required"
+	case "413":
+		return "Payload Too Large"
+	case "429":
+		return "Too Many Requests"
+	case "500":
+		return "Internal Server Error"
+	case "501":
+		return "Not Implemented"
+	case "502":
+		return "Bad Gateway"
+	case "503":
+		return "Service Unavailable"
+	case "504":
+		return "Gateway Timeout"
+	default:
+		return "Unknown"
+	}
+}
+
+func (s *Response) isValidStatusCode(statusCode Statuscode) bool {
+	switch statusCode {
+	case StatusOk, StatusBadRequest, StatusNotFound, StatusRequestTimeout, StatusLengthRequired, StatusPayloadTooLarge, StatusTooManyRequests, StatusInternalServerError, StatusNotImplemented, StatusBadGateway, StatusServiceUnavailable, StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Response) Status(statusCode Statuscode) *Response {
+	if !s.isValidStatusCode(statusCode) {
+		panic(fmt.Sprintf("Invalid status code: %d", statusCode))
+	}
+	s.status = strconv.Itoa(int(statusCode))
+	return s
+}
+
+func (s *Response) SetHeader(key, value string) *Response {
+	s.headers[key] = value
+	return s
+}
+
+func (s *Response) Setbody(body string) *Response {
+	s.body = body
+	return s
+}
+
+func (s *Response) Send(msg string) {
+	c := *s.conn
+	c.Write([]byte(fmt.Sprintf("HTTP/1.1 %s %s\r\nContent-Length: %d\r\nContent-Type: text/html\r\n\r\n%s", s.status, msg, len(s.body), msg)))
+}
 
 func (s *HTTPServer) ListenAndServe(addr, port string) {
 	s.addr = addr
@@ -102,11 +191,11 @@ func (s *HTTPServer) handleConnections() {
 			continue
 		}
 		fmt.Printf("🔥 Yui handling Connection from %s\n", conn.RemoteAddr().String())
-		go parseConn(conn)
+		go handleConn(conn)
 	}
 }
 
-func parseConn(conn net.Conn) {
+func handleConn(conn net.Conn) {
 	defer conn.Close()
 	var data []byte
 	chunk := make([]byte, max_chunk_size) // 1 byte buffer
@@ -158,8 +247,8 @@ func parseConn(conn net.Conn) {
 	}
 
 	// Create the Request Object
-	req := &Request{Headers: make(map[string]string)}
-	res := &Response{}
+	req := &Request{Headers: make(map[string]string), conn: &conn}
+	res := &Response{conn: &conn}
 	ParseHeader(req, strings.Split(string(headerBlock), CRLF))
 	if req.Method == "" || req.Path == "" || req.Version == "" || req.Host == "" || len(req.Headers) == 0 {
 		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
@@ -195,8 +284,7 @@ func parseConn(conn net.Conn) {
 		req.Body = string(data[bodyBlockIdx:])
 	}
 	key := strings.ToLower(req.Method) + ":" + req.Path
-	if _, ok := HandlerMap[key]; ok {
-		handler := HandlerMap[key]
+	if handler, ok := HandlerMap[key]; ok {
 		handler(req, res)
 	} else {
 		conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
