@@ -1,10 +1,17 @@
 package main
 
 import (
-	server "github.com/pythonwithsean/httpserver/server"
+	"fmt"
+
+	"github.com/pythonwithsean/Yui/yui"
 )
 
 func main() {
-	s := server.NewServer("localhost", ":8000")
-	s.Start()
+	s := yui.NewServer()
+	s.Get("/", func(req *yui.Request, res *yui.Response) {
+	})
+	s.Get("/home", func(req *yui.Request, res *yui.Response) {
+		fmt.Println("Hello from /home endpoint")
+	})
+	s.ListenAndServe("localhost", ":8000")
 }

@@ -1,4 +1,4 @@
-package server
+package yui
 
 import (
 	"errors"
@@ -14,12 +14,12 @@ const max_header_size = 8192               // 8KB
 const max_chunk_size = 1                   // 1 Byte
 const max_conn_duration = 30 * time.Second // 30 seconds
 const CRLF = "\r\n"                        // Carriage Return + Line Feed
-const max_body_size = 1024 * 1024 // 1MB
+const max_body_size = 1024 * 1024          // 1MB
 
-type Server struct {
+type HTTPServer struct {
 	addr     string
 	port     string
-	Listener net.Listener
+	listener net.Listener
 }
 
 type Request struct {
@@ -31,12 +31,16 @@ type Request struct {
 	Body    string
 }
 
-func NewServer(addr, port string) *Server {
-	return &Server{
-		addr:     addr,
-		port:     port,
-		Listener: nil,
-	}
+type Response struct {
+	headers map[string]string
+	body    string
+}
+
+// Maps verb:path -> function defined by the user
+var HandlerMap = make(map[string]func(req *Request, res *Response))
+
+func NewServer() *HTTPServer {
+	return &HTTPServer{}
 }
 
 func newListener(addr string) net.Listener {
@@ -47,31 +51,62 @@ func newListener(addr string) net.Listener {
 	return listener
 }
 
-func (s *Server) Start() {
-	addr := s.addr + s.port
-	listener := newListener(addr)
-	s.Listener = listener
-	defer s.Listener.Close()
-	fmt.Printf("Listening on %s\n", addr)
+func (s *Response) Send(message string)         {}
+func (s *Response) Setheader(key, value string) {}
+func (s *Response) Setbody(message string)      {}
+
+func (s *HTTPServer) ListenAndServe(addr, port string) {
+	s.addr = addr
+	s.port = port
+	listener := newListener(s.addr + s.port)
+	s.listener = listener
+	defer s.listener.Close()
+	fmt.Printf("🔥 Yui Server Listening on %s\n", s.addr+s.port)
 	s.handleConnections()
 }
 
-func (s *Server) handleConnections() {
-	if s.Listener == nil {
+func (s *HTTPServer) Get(path string, handler func(req *Request, res *Response)) {
+	verb := "get"
+	key := verb + ":" + path
+	HandlerMap[key] = handler
+}
+
+func (s *HTTPServer) Post(path string, handler func(req *Request, res *Response)) {
+	verb := "post"
+	key := verb + ":" + path
+	HandlerMap[key] = handler
+
+}
+
+func (s *HTTPServer) Put(path string, handler func(req *Request, res *Response)) {
+	verb := "put"
+	key := verb + ":" + path
+	HandlerMap[key] = handler
+
+}
+
+func (s *HTTPServer) Delete(path string, handler func(req *Request, res *Response)) {
+	verb := "delete"
+	key := verb + ":" + path
+	HandlerMap[key] = handler
+}
+
+func (s *HTTPServer) handleConnections() {
+	if s.listener == nil {
 		panic("Listener is not initialized")
 	}
 	for {
-		conn, err := s.Listener.Accept()
+		conn, err := s.listener.Accept()
 		if err != nil {
 			fmt.Printf("Error with connection from %s\n", conn.RemoteAddr().String())
 			continue
 		}
-		// fmt.Printf("Handling Connection from %s\n", conn.RemoteAddr().String())
-		go handleConn(conn)
+		fmt.Printf("🔥 Yui handling Connection from %s\n", conn.RemoteAddr().String())
+		go parseConn(conn)
 	}
 }
 
-func handleConn(conn net.Conn) {
+func parseConn(conn net.Conn) {
 	defer conn.Close()
 	var data []byte
 	chunk := make([]byte, max_chunk_size) // 1 byte buffer
@@ -88,7 +123,8 @@ func handleConn(conn net.Conn) {
 		if err != nil {
 			// Check if the error is a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				conn.Write([]byte("HTTP/1.1 408 Request Timeout\r\n\r\n"))
+				msg := "HTTP/1.1 408 Request Timeout\r\n\r\n"
+				conn.Write([]byte(msg))
 				fmt.Printf("Timeout reading from connection: %s\n", err)
 				return
 			}
@@ -121,7 +157,9 @@ func handleConn(conn net.Conn) {
 		return
 	}
 
+	// Create the Request Object
 	req := &Request{Headers: make(map[string]string)}
+	res := &Response{}
 	ParseHeader(req, strings.Split(string(headerBlock), CRLF))
 	if req.Method == "" || req.Path == "" || req.Version == "" || req.Host == "" || len(req.Headers) == 0 {
 		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
@@ -155,8 +193,14 @@ func handleConn(conn net.Conn) {
 			data = append(data, bodyChunk[:n]...)
 		}
 		req.Body = string(data[bodyBlockIdx:])
-		fmt.Printf("Body: %s", req.Body)
 	}
-	body := "<html><body><h1>Hello, World!</h1></body></html>"
-	conn.Write([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nContent-Type: text/html\r\n\r\n%s", len(body), body)))
+	key := strings.ToLower(req.Method) + ":" + req.Path
+	if _, ok := HandlerMap[key]; ok {
+		handler := HandlerMap[key]
+		handler(req, res)
+	} else {
+		conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+		fmt.Printf("Error could not resolve path: %s\n", req.Path)
+		return
+	}
 }
