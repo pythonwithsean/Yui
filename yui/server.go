@@ -76,13 +76,38 @@ func newListener(addr string) net.Listener {
 }
 
 func (s *Response) buildHeader() string {
+	return buildResponseHeader(s.status, s.headers, s.body)
+}
+
+func buildResponseHeader(status string, headers map[string]string, body string) string {
 	var header strings.Builder
-	fmt.Fprintf(&header, "HTTP/1.1 %s %s\r\nContent-Length: %d\r\n", s.status, s.statusCodeToString(), len(s.body))
-	for key, value := range s.headers {
+	fmt.Fprintf(&header, "HTTP/1.1 %s %s\r\nContent-Length: %d\r\n", status, statusCodeToString(status), len(body))
+	for key, value := range headers {
 		fmt.Fprintf(&header, "%s: %s\r\n", key, value)
 	}
 	header.WriteString(CRLF)
 	return header.String()
+}
+
+func writeHTTPResponse(conn net.Conn, status string, headers map[string]string, body string) error {
+	response := buildResponseHeader(status, headers, body) + body
+	for len(response) > 0 {
+		n, err := conn.Write([]byte(response))
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		response = response[n:]
+	}
+	return nil
+}
+
+func writeErrorResponse(conn net.Conn, status string) {
+	if err := writeHTTPResponse(conn, status, nil, ""); err != nil {
+		fmt.Printf("Error writing HTTP %s response: %s\n", status, err)
+	}
 }
 
 func (s *Response) buildBody() string {
@@ -90,7 +115,11 @@ func (s *Response) buildBody() string {
 }
 
 func (s *Response) statusCodeToString() string {
-	switch s.status {
+	return statusCodeToString(s.status)
+}
+
+func statusCodeToString(status string) string {
+	switch status {
 	case "200":
 		return "OK"
 	case "400":
@@ -151,9 +180,10 @@ func (s *Response) Setbody(body string) *Response {
 }
 
 func (s *Response) Send(msg string) {
-	c := *s.conn
 	s.body = msg
-	c.Write([]byte(s.buildHeader() + msg))
+	if err := writeHTTPResponse(*s.conn, s.status, s.headers, msg); err != nil {
+		fmt.Printf("Error writing HTTP response: %s\n", err)
+	}
 }
 
 func (s *HTTPServer) ListenAndServe(addr, port string) {
@@ -229,8 +259,7 @@ func readHeader(conn net.Conn, data *[]byte, buff []byte) (int, error) {
 		if err != nil {
 			// Check if the error is a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				msg := "HTTP/1.1 408 Request Timeout\r\n\r\n"
-				conn.Write([]byte(msg))
+				writeErrorResponse(conn, "408")
 				fmt.Printf("Timeout reading from connection: %s\n", err)
 				return -1, err
 			}
@@ -241,14 +270,14 @@ func readHeader(conn net.Conn, data *[]byte, buff []byte) (int, error) {
 			}
 
 			// For other errors, send a 400 Bad Request response
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			writeErrorResponse(conn, "400")
 			fmt.Printf("Error reading from connection: %s\n", err)
 			return -1, err
 		}
 
 		// Check if the accumulated data exceeds the maximum header size
 		if len(*data) > max_header_size {
-			conn.Write([]byte("HTTP/1.1 413 Payload Too Large\r\n\r\n"))
+			writeErrorResponse(conn, "413")
 			fmt.Printf("Header too large from %s\n", conn.RemoteAddr().String())
 			return -1, errors.New("header too large")
 		}
@@ -264,14 +293,14 @@ func readBody(conn net.Conn, data *[]byte, buff []byte, headerIdx int, contentLe
 
 	// A negative Content-Length is malformed; guard before it reaches a slice bound
 	if contentLength < 0 {
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		writeErrorResponse(conn, "400")
 		fmt.Printf("Negative Content-Length from %s\n", conn.RemoteAddr().String())
 		return -1, errors.New("negative content-length")
 	}
 
 	// Check if the declared body exceeds the maximum body size
 	if contentLength > max_body_size {
-		conn.Write([]byte("HTTP/1.1 413 Payload Too Large\r\n\r\n"))
+		writeErrorResponse(conn, "413")
 		fmt.Printf("Body too large from %s\n", conn.RemoteAddr().String())
 		return -1, errors.New("body too large")
 	}
@@ -285,20 +314,20 @@ func readBody(conn net.Conn, data *[]byte, buff []byte, headerIdx int, contentLe
 		if err != nil {
 			// Check if the error is a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				conn.Write([]byte("HTTP/1.1 408 Request Timeout\r\n\r\n"))
+				writeErrorResponse(conn, "408")
 				fmt.Printf("Timeout reading from connection: %s\n", err)
 				return -1, err
 			}
 
 			// Client closed before sending the body it promised
 			if errors.Is(err, io.EOF) {
-				conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+				writeErrorResponse(conn, "400")
 				fmt.Printf("Incomplete body from %s: got %d of %d bytes\n", conn.RemoteAddr().String(), len(*data)-headerIdx, contentLength)
 				return -1, errors.New("incomplete body")
 			}
 
 			// For other errors, send a 400 Bad Request response
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			writeErrorResponse(conn, "400")
 			fmt.Printf("Error reading from connection: %s\n", err)
 			return -1, err
 		}
@@ -323,7 +352,7 @@ func handleConn(conn net.Conn) {
 		return
 	}
 	if headerIdx == -1 {
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		writeErrorResponse(conn, "400")
 		fmt.Printf("No header found in connection: %s\n", conn.RemoteAddr().String())
 		return
 	}
@@ -346,7 +375,7 @@ func handleConn(conn net.Conn) {
 	if ok {
 		contentLength, err := strconv.Atoi(contentLengthString)
 		if err != nil {
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			writeErrorResponse(conn, "400")
 			fmt.Printf("Invalid Content-Length %q from %s\n", contentLengthString, conn.RemoteAddr().String())
 			return
 		}
@@ -367,7 +396,7 @@ func handleConn(conn net.Conn) {
 	if handler, ok := HandlerMap[key]; ok {
 		handler(req, res)
 	} else {
-		conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+		writeErrorResponse(conn, "404")
 		fmt.Printf("Error could not resolve path: %s\n", req.Path)
 		return
 	}
