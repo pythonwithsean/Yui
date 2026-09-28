@@ -1,6 +1,7 @@
 package yui
 
 import (
+	"errors"
 	"log"
 	"strings"
 )
@@ -81,35 +82,37 @@ func ParseHeaderField(line string) (string, string, bool) {
 	return key, value, true
 }
 
-func ParseHeader(req *Request, header []string) {
+func MakeHeader(req *Request, header []string) error {
 	if len(header) == 0 {
-		return
+		return errors.New("empty header")
 	}
 
-	parts := strings.Split(strings.TrimSpace(header[0]), " ")
-	if len(parts) != 3 {
-		log.Printf("Invalid request line: expected 3 parts, got %d: %q", len(parts), header[0])
-		return
+	// http version method path
+	firstLine := strings.Split(strings.TrimSpace(header[0]), " ")
+	if len(firstLine) != 3 {
+		log.Printf("Invalid request line: expected 3 parts, got %d: %q", len(firstLine), header[0])
+		return errors.New("invalid request line")
 	}
-	if !IsValidMethod(parts[0]) {
-		log.Printf("Invalid HTTP method: %q", parts[0])
-		return
+	if !IsValidMethod(firstLine[0]) {
+		log.Printf("Invalid HTTP method: %q", firstLine[0])
+		return errors.New("invalid HTTP method")
 	}
-	if !IsValidPath(parts[1]) {
-		log.Printf("Invalid path: %q (must start with /)", parts[1])
-		return
+	if !IsValidPath(firstLine[1]) {
+		log.Printf("Invalid path: %q (must start with /)", firstLine[1])
+		return errors.New("invalid path")
 	}
-	if !IsValidVersion(parts[2]) {
-		log.Printf("Invalid HTTP version: %q", parts[2])
-		return
+	if !IsValidVersion(firstLine[2]) {
+		log.Printf("Invalid HTTP version: %q", firstLine[2])
+		return errors.New("invalid HTTP version")
 	}
-	if !IsValidHeaderValue(parts[0]) || !IsValidHeaderValue(parts[1]) || !IsValidHeaderValue(parts[2]) {
+	if !IsValidHeaderValue(firstLine[0]) || !IsValidHeaderValue(firstLine[1]) || !IsValidHeaderValue(firstLine[2]) {
 		log.Printf("Invalid characters in request line: %q", header[0])
-		return
+		return errors.New("invalid characters in request line")
 	}
-	req.Method = strings.ToLower(parts[0])
-	req.Path = strings.ToLower(parts[1])
-	req.Version = strings.ToLower(parts[2])
+
+	req.method = strings.ToLower(firstLine[0])
+	req.Path = strings.ToLower(firstLine[1])
+	req.version = strings.ToLower(firstLine[2])
 
 	//TODO: duplicate req.Headers key overwite each other
 	//TODO-SOL: use a map[string][]string to store multiple values for the same header key, or use a custom struct to hold the headers and their values. This way, you can preserve all header values without overwriting them.
@@ -124,11 +127,12 @@ func ParseHeader(req *Request, header []string) {
 			continue
 		}
 		// NOTE: im making everything lower case so i dont have to worry about casing ever in processing
-		req.Headers[strings.ToLower(key)] = strings.ToLower(value)
+		req.headers[strings.ToLower(key)] = strings.ToLower(value)
 		if strings.ToUpper(key) == "HOST" {
-			req.Host = strings.ToLower(value)
+			req.host = strings.ToLower(value)
 		}
 	}
+	return nil
 }
 
 func ParseBody(req *Request, body string) {
