@@ -6,7 +6,7 @@ import (
 	httpServer "github.com/pythonwithsean/httpserver/server"
 )
 
-func TestParseHeader(t *testing.T) {
+func TestMakeHeader(t *testing.T) {
 	header := []string{
 		"GET / HTTP/1.1",
 		"Host: localhost:5100",
@@ -15,7 +15,7 @@ func TestParseHeader(t *testing.T) {
 	}
 
 	req := &httpServer.Request{Headers: make(map[string]string)}
-	httpServer.ParseHeader(req, header)
+	httpServer.MakeHeader(req, header)
 
 	if req.Method != "get" {
 		t.Errorf("Expected Method 'get', got '%s'", req.Method)

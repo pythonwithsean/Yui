@@ -15,6 +15,7 @@ const max_chunk_size = 1                   // 1 Byte
 const max_conn_duration = 30 * time.Second // 30 seconds
 const CRLF = "\r\n"                        // Carriage Return + Line Feed
 const max_body_size = 1024 * 1024          // 1MB
+const max_payload_size = 1024 * 1024 * 10  // 10MB
 
 type HTTPServer struct {
 	addr     string
@@ -23,10 +24,10 @@ type HTTPServer struct {
 }
 
 type Request struct {
-	Method  string
+	method  string
 	Path    string
-	Version string
-	Host    string
+	version string
+	host    string
 	Headers map[string]string
 	Body    string
 	conn    *net.Conn
@@ -53,6 +54,7 @@ type Statuscode int
 
 type Response struct {
 	headers map[string]string
+	method  string
 	status  string
 	body    string
 	conn    *net.Conn
@@ -74,11 +76,17 @@ func newListener(addr string) net.Listener {
 }
 
 func (s *Response) buildHeader() string {
-	return ""
+	var header strings.Builder
+	fmt.Fprintf(&header, "HTTP/1.1 %s %s\r\nContent-Length: %d\r\n", s.status, s.statusCodeToString(), len(s.body))
+	for key, value := range s.headers {
+		fmt.Fprintf(&header, "%s: %s\r\n", key, value)
+	}
+	header.WriteString(CRLF)
+	return header.String()
 }
 
 func (s *Response) buildBody() string {
-	return ""
+	return fmt.Sprintf("")
 }
 
 func (s *Response) statusCodeToString() string {
@@ -130,6 +138,9 @@ func (s *Response) Status(statusCode Statuscode) *Response {
 }
 
 func (s *Response) SetHeader(key, value string) *Response {
+	if s.headers == nil {
+		s.headers = make(map[string]string)
+	}
 	s.headers[key] = value
 	return s
 }
@@ -141,10 +152,14 @@ func (s *Response) Setbody(body string) *Response {
 
 func (s *Response) Send(msg string) {
 	c := *s.conn
-	c.Write([]byte(fmt.Sprintf("HTTP/1.1 %s %s\r\nContent-Length: %d\r\nContent-Type: text/html\r\n\r\n%s", s.status, msg, len(s.body), msg)))
+	s.body = msg
+	c.Write([]byte(s.buildHeader() + msg))
 }
 
 func (s *HTTPServer) ListenAndServe(addr, port string) {
+	if len(HandlerMap) == 0 {
+		fmt.Println("Warning: No handlers registered. The server will respond with 404 Not Found for all requests.")
+	}
 	s.addr = addr
 	s.port = port
 	listener := newListener(s.addr + s.port)
@@ -155,28 +170,36 @@ func (s *HTTPServer) ListenAndServe(addr, port string) {
 }
 
 func (s *HTTPServer) Get(path string, handler func(req *Request, res *Response)) {
-	verb := "get"
-	key := verb + ":" + path
+	if HandlerMap == nil {
+		HandlerMap = make(map[string]func(req *Request, res *Response))
+	}
+	key := "get" + ":" + path
 	HandlerMap[key] = handler
 }
 
 func (s *HTTPServer) Post(path string, handler func(req *Request, res *Response)) {
-	verb := "post"
-	key := verb + ":" + path
+	if HandlerMap == nil {
+		HandlerMap = make(map[string]func(req *Request, res *Response))
+	}
+	key := "post" + ":" + path
 	HandlerMap[key] = handler
 
 }
 
 func (s *HTTPServer) Put(path string, handler func(req *Request, res *Response)) {
-	verb := "put"
-	key := verb + ":" + path
+	if HandlerMap == nil {
+		HandlerMap = make(map[string]func(req *Request, res *Response))
+	}
+	key := "put" + ":" + path
 	HandlerMap[key] = handler
 
 }
 
 func (s *HTTPServer) Delete(path string, handler func(req *Request, res *Response)) {
-	verb := "delete"
-	key := verb + ":" + path
+	if HandlerMap == nil {
+		HandlerMap = make(map[string]func(req *Request, res *Response))
+	}
+	key := "delete" + ":" + path
 	HandlerMap[key] = handler
 }
 
@@ -195,19 +218,13 @@ func (s *HTTPServer) handleConnections() {
 	}
 }
 
-func handleConn(conn net.Conn) {
-	defer conn.Close()
-	var data []byte
-	chunk := make([]byte, max_chunk_size) // 1 byte buffer
-	var headerBlock []byte
-	var bodyBlockIdx int
-	// if json header has connection: keep-alive, we should keep the connection open for a certain duration
-	conn.SetDeadline(time.Now().Add(max_conn_duration)) // Set a deadline for the connection
+func readHeader(conn net.Conn, data *[]byte, buff []byte) (int, error) {
+
 	for {
 		// Set a deadline for the connection to avoid hanging connections
-		n, err := conn.Read(chunk)
+		n, err := conn.Read(buff)
 		if n > 0 {
-			data = append(data, chunk[:n]...)
+			*(data) = append(*(data), buff[:n]...)
 		}
 		if err != nil {
 			// Check if the error is a timeout error
@@ -215,75 +232,138 @@ func handleConn(conn net.Conn) {
 				msg := "HTTP/1.1 408 Request Timeout\r\n\r\n"
 				conn.Write([]byte(msg))
 				fmt.Printf("Timeout reading from connection: %s\n", err)
-				return
+				return -1, err
 			}
+
+			// Client closed the connection; process whatever data we have
 			if errors.Is(err, io.EOF) {
-				// Client closed the connection; process whatever data we have
-				break
+				return -1, err
 			}
+
 			// For other errors, send a 400 Bad Request response
 			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 			fmt.Printf("Error reading from connection: %s\n", err)
-			return
+			return -1, err
 		}
+
 		// Check if the accumulated data exceeds the maximum header size
-		if len(data) > max_header_size {
+		if len(*data) > max_header_size {
 			conn.Write([]byte("HTTP/1.1 413 Payload Too Large\r\n\r\n"))
 			fmt.Printf("Header too large from %s\n", conn.RemoteAddr().String())
-			return
+			return -1, errors.New("header too large")
 		}
+
 		// Check if we have received the end of the header section
-		if idx := strings.Index(string(data), CRLF+CRLF); idx != -1 {
-			headerBlock = data[:idx]
-			bodyBlockIdx = idx + len(CRLF+CRLF)
-			break
+		if idx := strings.Index(string(*data), CRLF+CRLF); idx != -1 {
+			return idx + len(CRLF+CRLF), nil
+		}
+	}
+}
+
+func readBody(conn net.Conn, data *[]byte, buff []byte, headerIdx int, contentLength int) (int, error) {
+
+	// A negative Content-Length is malformed; guard before it reaches a slice bound
+	if contentLength < 0 {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		fmt.Printf("Negative Content-Length from %s\n", conn.RemoteAddr().String())
+		return -1, errors.New("negative content-length")
+	}
+
+	// Check if the declared body exceeds the maximum body size
+	if contentLength > max_body_size {
+		conn.Write([]byte("HTTP/1.1 413 Payload Too Large\r\n\r\n"))
+		fmt.Printf("Body too large from %s\n", conn.RemoteAddr().String())
+		return -1, errors.New("body too large")
+	}
+
+	// readHeader may have already buffered part (or all) of the body
+	for len(*data)-headerIdx < contentLength {
+		n, err := conn.Read(buff)
+		if n > 0 {
+			*(data) = append(*(data), buff[:n]...)
+		}
+		if err != nil {
+			// Check if the error is a timeout error
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				conn.Write([]byte("HTTP/1.1 408 Request Timeout\r\n\r\n"))
+				fmt.Printf("Timeout reading from connection: %s\n", err)
+				return -1, err
+			}
+
+			// Client closed before sending the body it promised
+			if errors.Is(err, io.EOF) {
+				conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+				fmt.Printf("Incomplete body from %s: got %d of %d bytes\n", conn.RemoteAddr().String(), len(*data)-headerIdx, contentLength)
+				return -1, errors.New("incomplete body")
+			}
+
+			// For other errors, send a 400 Bad Request response
+			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			fmt.Printf("Error reading from connection: %s\n", err)
+			return -1, err
 		}
 	}
 
-	if len(headerBlock) == 0 {
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-		fmt.Printf("No header received from %s\n", conn.RemoteAddr().String())
+	return headerIdx + contentLength, nil
+}
+
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	data := make([]byte, 0, max_payload_size) // Initialize a slice to hold the raw data
+	buff := make([]byte, max_chunk_size)      // 1 byte buffer
+
+	// if json header has connection: keep-alive, we should keep the connection open for a certain duration
+	conn.SetDeadline(time.Now().Add(max_conn_duration)) // Set a deadline for the connection
+
+	// Read the raw connection data and parse the header and body
+	headerIdx, err := readHeader(conn, &data, buff)
+	if err != nil {
+		fmt.Printf("Error reading header from connection: %s\n", err)
 		return
 	}
+	if headerIdx == -1 {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		fmt.Printf("No header found in connection: %s\n", conn.RemoteAddr().String())
+		return
+	}
+
+	headerBuff := strings.TrimRight(string(data[:headerIdx]), CRLF)
 
 	// Create the Request Object
 	req := &Request{Headers: make(map[string]string), conn: &conn}
-	res := &Response{conn: &conn}
-	ParseHeader(req, strings.Split(string(headerBlock), CRLF))
-	if req.Method == "" || req.Path == "" || req.Version == "" || req.Host == "" || len(req.Headers) == 0 {
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-		fmt.Printf("Invalid request from %s\n", conn.RemoteAddr().String())
+	res := &Response{headers: make(map[string]string), conn: &conn}
+
+	err = MakeHeader(req, strings.Split(headerBuff, CRLF))
+	if err != nil {
+		fmt.Printf("Error making header: %s\n", err)
 		return
 	}
+	var bodyBuff []byte
 
-	_, ok := req.Headers["content-length"]
+	contentLengthString, ok := req.Headers["content-length"]
+
 	if ok {
-		cl, err := strconv.Atoi(req.Headers["content-length"])
+		contentLength, err := strconv.Atoi(contentLengthString)
 		if err != nil {
 			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-			fmt.Printf("Error reading from connection: %s\n", err)
+			fmt.Printf("Invalid Content-Length %q from %s\n", contentLengthString, conn.RemoteAddr().String())
 			return
 		}
-		if cl > max_body_size {
-			conn.Write([]byte("HTTP/1.1 413 Payload Too Large\r\n\r\n"))
-			fmt.Printf("Body too large from %s\n", conn.RemoteAddr().String())
+
+		// Read the body and parse it onto the Request
+		bodyIdx, err := readBody(conn, &data, buff, headerIdx, contentLength)
+		if err != nil {
+			fmt.Printf("Error reading body from connection: %s\n", err)
 			return
 		}
-		remaining_body_bytes := cl - (len(data) - bodyBlockIdx)
-		if remaining_body_bytes > 0 {
-			// Read the remaining body bytes
-			bodyChunk := make([]byte, remaining_body_bytes)
-			n, err := conn.Read(bodyChunk)
-			if err != nil {
-				conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-				fmt.Printf("Error reading from connection: %s\n", err)
-				return
-			}
-			data = append(data, bodyChunk[:n]...)
-		}
-		req.Body = string(data[bodyBlockIdx:])
+
+		bodyBuff = data[headerIdx:bodyIdx]
+		ParseBody(req, string(bodyBuff))
 	}
-	key := strings.ToLower(req.Method) + ":" + req.Path
+
+	// Handle the request by looking up the appropriate handler in the HandlerMap
+	key := strings.ToLower(req.method) + ":" + req.Path
 	if handler, ok := HandlerMap[key]; ok {
 		handler(req, res)
 	} else {

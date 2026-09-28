@@ -13,7 +13,7 @@ func main() {
 	})
 
 	s.Get("/home", func(req *yui.Request, res *yui.Response) {
-		res.Status(200).Send("Daniel")
+		res.Status(200).Send("<h1>Welcome to the Home Page</h1>")
 	})
 
 	s.ListenAndServe("localhost", ":8000")
