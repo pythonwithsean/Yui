@@ -127,10 +127,14 @@ func MakeHeader(req *Request, header []string) error {
 			continue
 		}
 		// NOTE: im making everything lower case so i dont have to worry about casing ever in processing
-		req.headers[strings.ToLower(key)] = strings.ToLower(value)
+		req.Headers[strings.ToLower(key)] = strings.ToLower(value)
 		if strings.ToUpper(key) == "HOST" {
 			req.host = strings.ToLower(value)
 		}
+	}
+
+	if req.method == "" || req.Path == "" || req.version == "" || req.host == "" || len(req.Headers) == 0 {
+		return errors.New("invalid request: missing required fields")
 	}
 	return nil
 }

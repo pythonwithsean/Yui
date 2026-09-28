@@ -28,7 +28,7 @@ type Request struct {
 	Path    string
 	version string
 	host    string
-	headers map[string]string
+	Headers map[string]string
 	Body    string
 	conn    *net.Conn
 }
@@ -157,6 +157,9 @@ func (s *Response) Send(msg string) {
 }
 
 func (s *HTTPServer) ListenAndServe(addr, port string) {
+	if len(HandlerMap) == 0 {
+		fmt.Println("Warning: No handlers registered. The server will respond with 404 Not Found for all requests.")
+	}
 	s.addr = addr
 	s.port = port
 	listener := newListener(s.addr + s.port)
@@ -257,6 +260,53 @@ func readHeader(conn net.Conn, data *[]byte, buff []byte) (int, error) {
 	}
 }
 
+func readBody(conn net.Conn, data *[]byte, buff []byte, headerIdx int, contentLength int) (int, error) {
+
+	// A negative Content-Length is malformed; guard before it reaches a slice bound
+	if contentLength < 0 {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		fmt.Printf("Negative Content-Length from %s\n", conn.RemoteAddr().String())
+		return -1, errors.New("negative content-length")
+	}
+
+	// Check if the declared body exceeds the maximum body size
+	if contentLength > max_body_size {
+		conn.Write([]byte("HTTP/1.1 413 Payload Too Large\r\n\r\n"))
+		fmt.Printf("Body too large from %s\n", conn.RemoteAddr().String())
+		return -1, errors.New("body too large")
+	}
+
+	// readHeader may have already buffered part (or all) of the body
+	for len(*data)-headerIdx < contentLength {
+		n, err := conn.Read(buff)
+		if n > 0 {
+			*(data) = append(*(data), buff[:n]...)
+		}
+		if err != nil {
+			// Check if the error is a timeout error
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				conn.Write([]byte("HTTP/1.1 408 Request Timeout\r\n\r\n"))
+				fmt.Printf("Timeout reading from connection: %s\n", err)
+				return -1, err
+			}
+
+			// Client closed before sending the body it promised
+			if errors.Is(err, io.EOF) {
+				conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+				fmt.Printf("Incomplete body from %s: got %d of %d bytes\n", conn.RemoteAddr().String(), len(*data)-headerIdx, contentLength)
+				return -1, errors.New("incomplete body")
+			}
+
+			// For other errors, send a 400 Bad Request response
+			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			fmt.Printf("Error reading from connection: %s\n", err)
+			return -1, err
+		}
+	}
+
+	return headerIdx + contentLength, nil
+}
+
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 
@@ -281,50 +331,44 @@ func handleConn(conn net.Conn) {
 	headerBuff := strings.TrimRight(string(data[:headerIdx]), CRLF)
 
 	// Create the Request Object
-	req := &Request{headers: make(map[string]string), conn: &conn}
-	// res := &Response{headers: make(map[string]string), conn: &conn}
+	req := &Request{Headers: make(map[string]string), conn: &conn}
+	res := &Response{headers: make(map[string]string), conn: &conn}
 
-	MakeHeader(req, strings.Split(headerBuff, CRLF))
+	err = MakeHeader(req, strings.Split(headerBuff, CRLF))
+	if err != nil {
+		fmt.Printf("Error making header: %s\n", err)
+		return
+	}
+	var bodyBuff []byte
 
-	// if req.method == "" || req.Path == "" || req.version == "" || req.host == "" || len(req.headers) == 0 {
-	// 	conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-	// 	fmt.Printf("Invalid request from %s\n", conn.RemoteAddr().String())
-	// 	return
-	// }
+	contentLengthString, ok := req.Headers["content-length"]
 
-	// _, ok := req.headers["content-length"]
-	// if ok {
-	// 	cl, err := strconv.Atoi(req.headers["content-length"])
-	// 	if err != nil {
-	// 		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-	// 		fmt.Printf("Error reading from connection: %s\n", err)
-	// 		return
-	// 	}
-	// 	if cl > max_body_size {
-	// 		conn.Write([]byte("HTTP/1.1 413 Payload Too Large\r\n\r\n"))
-	// 		fmt.Printf("Body too large from %s\n", conn.RemoteAddr().String())
-	// 		return
-	// 	}
-	// 	remaining_body_bytes := cl - (len(data) - bodyBlockIdx)
-	// 	if remaining_body_bytes > 0 {
-	// 		// Read the remaining body bytes
-	// 		bodyChunk := make([]byte, remaining_body_bytes)
-	// 		n, err := conn.Read(bodyChunk)
-	// 		if err != nil {
-	// 			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-	// 			fmt.Printf("Error reading from connection: %s\n", err)
-	// 			return
-	// 		}
-	// 		data = append(data, bodyChunk[:n]...)
-	// 	}
-	// 	req.Body = string(data[bodyBlockIdx:])
-	// }
-	// key := strings.ToLower(req.method) + ":" + req.Path
-	// if handler, ok := HandlerMap[key]; ok {
-	// 	handler(req, res)
-	// } else {
-	// 	conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-	// 	fmt.Printf("Error could not resolve path: %s\n", req.Path)
-	// 	return
-	// }
+	if ok {
+		contentLength, err := strconv.Atoi(contentLengthString)
+		if err != nil {
+			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			fmt.Printf("Invalid Content-Length %q from %s\n", contentLengthString, conn.RemoteAddr().String())
+			return
+		}
+
+		// Read the body and parse it onto the Request
+		bodyIdx, err := readBody(conn, &data, buff, headerIdx, contentLength)
+		if err != nil {
+			fmt.Printf("Error reading body from connection: %s\n", err)
+			return
+		}
+
+		bodyBuff = data[headerIdx:bodyIdx]
+		ParseBody(req, string(bodyBuff))
+	}
+
+	// Handle the request by looking up the appropriate handler in the HandlerMap
+	key := strings.ToLower(req.method) + ":" + req.Path
+	if handler, ok := HandlerMap[key]; ok {
+		handler(req, res)
+	} else {
+		conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+		fmt.Printf("Error could not resolve path: %s\n", req.Path)
+		return
+	}
 }
