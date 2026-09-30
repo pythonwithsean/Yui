@@ -1,6 +1,7 @@
 package yui
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -71,6 +72,30 @@ func newListener(addr string) net.Listener {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		panic(fmt.Sprintf("Error starting server on %s: %v", addr, err))
+	}
+	return listener
+}
+
+// newTLSListener returns a listener that speaks TLS. The listener it hands back
+// is still a net.Listener, and the connections it accepts are still net.Conn, so
+// nothing downstream of Accept has to know encryption is happening.
+func newTLSListener(addr, certFile, keyFile string) net.Listener {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		panic(fmt.Sprintf("Error loading TLS certificate: %v", err))
+	}
+
+	config := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		// ALPN: tell the client we only speak HTTP/1.1. Without this a browser
+		// may negotiate h2 and send HTTP/2 binary frames the parser can't read.
+		NextProtos: []string{"http/1.1"},
+	}
+
+	listener, err := tls.Listen("tcp", addr, config)
+	if err != nil {
+		panic(fmt.Sprintf("Error starting TLS server on %s: %v", addr, err))
 	}
 	return listener
 }
@@ -196,6 +221,20 @@ func (s *HTTPServer) ListenAndServe(addr, port string) {
 	s.listener = listener
 	defer s.listener.Close()
 	fmt.Printf("🔥 Yui Server Listening on %s\n", s.addr+s.port)
+	s.handleConnections()
+}
+
+// ListenAndServeTLS is ListenAndServe over an encrypted connection. The HTTP
+// parsing below it is identical; only the listener differs.
+func (s *HTTPServer) ListenAndServeTLS(addr, port, certFile, keyFile string) {
+	if len(HandlerMap) == 0 {
+		fmt.Println("Warning: No handlers registered. The server will respond with 404 Not Found for all requests.")
+	}
+	s.addr = addr
+	s.port = port
+	s.listener = newTLSListener(s.addr+s.port, certFile, keyFile)
+	defer s.listener.Close()
+	fmt.Printf("🔒 Yui Server Listening on https://%s\n", s.addr+s.port)
 	s.handleConnections()
 }
 
@@ -338,6 +377,17 @@ func readBody(conn net.Conn, data *[]byte, buff []byte, headerIdx int, contentLe
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
+
+	// On a TLS connection the handshake is lazy: Accept returns before it runs,
+	// and it would otherwise fail part-way through readHeader. Force it here so a
+	// failure closes the connection instead of writing plaintext errors into a
+	// tunnel the client cannot decrypt.
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		if err := tlsConn.Handshake(); err != nil {
+			fmt.Printf("TLS handshake failed from %s: %s\n", conn.RemoteAddr().String(), err)
+			return
+		}
+	}
 
 	data := make([]byte, 0, max_payload_size) // Initialize a slice to hold the raw data
 	buff := make([]byte, max_chunk_size)      // 1 byte buffer
