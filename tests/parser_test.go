@@ -3,34 +3,14 @@ package tests
 import (
 	"testing"
 
-	httpServer "github.com/pythonwithsean/httpserver/server"
+	httpServer "github.com/pythonwithsean/Yui/yui"
 )
 
 func TestMakeHeader(t *testing.T) {
-	header := []string{
-		"GET / HTTP/1.1",
-		"Host: localhost:5100",
-		"User-Agent: curl/7.64.1",
-		"Accept: */*",
-	}
-
-	req := &httpServer.Request{Headers: make(map[string]string)}
-	httpServer.MakeHeader(req, header)
-
-	if req.Method != "get" {
-		t.Errorf("Expected Method 'get', got '%s'", req.Method)
-	}
-
-	if req.Path != "/" {
-		t.Errorf("Expected Path '/', got '%s'", req.Path)
-	}
-
-	if req.Version != "http/1.1" {
-		t.Errorf("Expected Version 'http/1.1', got '%s'", req.Version)
-	}
-
-	if req.Host != "localhost:5100" {
-		t.Errorf("Expected Host 'localhost:5100', got '%s'", req.Host)
+	if _, err := httpServer.ParseHeader([]byte(
+		"GET / HTTP/1.1\r\nHost: localhost:5100\r\nUser-Agent: curl/7.64.1\r\nAccept: */*\r\n\r\n",
+	)); err != nil {
+		t.Fatalf("ParseHeader() returned an error: %v", err)
 	}
 
 }

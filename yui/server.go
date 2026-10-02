@@ -11,17 +11,62 @@ import (
 	"time"
 )
 
-const max_header_size = 8192               // 8KB
-const max_chunk_size = 1                   // 1 Byte
-const max_conn_duration = 30 * time.Second // 30 seconds
-const CRLF = "\r\n"                        // Carriage Return + Line Feed
-const max_body_size = 1024 * 1024          // 1MB
-const max_payload_size = 1024 * 1024 * 10  // 10MB
+const CRLF = "\r\n"
+
+const (
+	defaultMaxHeaderSize = 8192             // 8kb
+	defaultMaxBodySize   = 1024 * 1024      // 1mb
+	defaultHeaderTimeout = 10 * time.Second // 10 seconds
+	defaultBodyTimeout   = 30 * time.Second // 30 seconds
+	defaultIdleTimeout   = 5 * time.Second  // 5 seconds
+)
+
+type ServerConfig struct {
+	MaxHeaderSize int
+	MaxBodySize   int
+	HeaderTimeout time.Duration
+	BodyTimeout   time.Duration
+	IdleTimeout   time.Duration
+}
+
+func DefaultServerConfig() ServerConfig {
+	return ServerConfig{
+		MaxHeaderSize: defaultMaxHeaderSize,
+		MaxBodySize:   defaultMaxBodySize,
+		HeaderTimeout: defaultHeaderTimeout,
+		BodyTimeout:   defaultBodyTimeout,
+		IdleTimeout:   defaultIdleTimeout,
+	}
+}
+
+func (c ServerConfig) withDefaults() ServerConfig {
+	defaults := DefaultServerConfig()
+	if c.MaxHeaderSize <= 0 {
+		c.MaxHeaderSize = defaults.MaxHeaderSize
+	}
+	if c.MaxHeaderSize < len(CRLF+CRLF) {
+		c.MaxHeaderSize = len(CRLF + CRLF)
+	}
+	if c.MaxBodySize <= 0 {
+		c.MaxBodySize = defaults.MaxBodySize
+	}
+	if c.HeaderTimeout <= 0 {
+		c.HeaderTimeout = defaults.HeaderTimeout
+	}
+	if c.BodyTimeout <= 0 {
+		c.BodyTimeout = defaults.BodyTimeout
+	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = defaults.IdleTimeout
+	}
+	return c
+}
 
 type HTTPServer struct {
 	addr     string
 	port     string
 	listener net.Listener
+	config   ServerConfig
 }
 
 type Request struct {
@@ -37,18 +82,19 @@ type Request struct {
 // TODO: Setup Custom Status Code Type
 
 const (
-	StatusOk                  Statuscode = 200
-	StatusBadRequest          Statuscode = 400
-	StatusNotFound            Statuscode = 404
-	StatusRequestTimeout      Statuscode = 408
-	StatusLengthRequired      Statuscode = 411
-	StatusPayloadTooLarge     Statuscode = 413
-	StatusTooManyRequests     Statuscode = 429
-	StatusInternalServerError Statuscode = 500
-	StatusNotImplemented      Statuscode = 501
-	StatusBadGateway          Statuscode = 502
-	StatusServiceUnavailable  Statuscode = 503
-	StatusGatewayTimeout      Statuscode = 504
+	StatusOk                    Statuscode = 200
+	StatusBadRequest            Statuscode = 400
+	StatusNotFound              Statuscode = 404
+	StatusRequestTimeout        Statuscode = 408
+	StatusLengthRequired        Statuscode = 411
+	StatusPayloadTooLarge       Statuscode = 413
+	StatusRequestHeaderTooLarge Statuscode = 431
+	StatusTooManyRequests       Statuscode = 429
+	StatusInternalServerError   Statuscode = 500
+	StatusNotImplemented        Statuscode = 501
+	StatusBadGateway            Statuscode = 502
+	StatusServiceUnavailable    Statuscode = 503
+	StatusGatewayTimeout        Statuscode = 504
 )
 
 type Statuscode int
@@ -64,8 +110,12 @@ type Response struct {
 // Maps verb:path -> function defined by the user
 var HandlerMap = make(map[string]func(req *Request, res *Response))
 
-func NewServer() *HTTPServer {
-	return &HTTPServer{}
+func NewServer(config ...ServerConfig) *HTTPServer {
+	serverConfig := DefaultServerConfig()
+	if len(config) > 0 {
+		serverConfig = config[0].withDefaults()
+	}
+	return &HTTPServer{config: serverConfig}
 }
 
 func newListener(addr string) net.Listener {
@@ -76,9 +126,6 @@ func newListener(addr string) net.Listener {
 	return listener
 }
 
-// newTLSListener returns a listener that speaks TLS. The listener it hands back
-// is still a net.Listener, and the connections it accepts are still net.Conn, so
-// nothing downstream of Accept has to know encryption is happening.
 func newTLSListener(addr, certFile, keyFile string) net.Listener {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -157,6 +204,8 @@ func statusCodeToString(status string) string {
 		return "Length Required"
 	case "413":
 		return "Payload Too Large"
+	case "431":
+		return "Request Header Fields Too Large"
 	case "429":
 		return "Too Many Requests"
 	case "500":
@@ -176,7 +225,7 @@ func statusCodeToString(status string) string {
 
 func (s *Response) isValidStatusCode(statusCode Statuscode) bool {
 	switch statusCode {
-	case StatusOk, StatusBadRequest, StatusNotFound, StatusRequestTimeout, StatusLengthRequired, StatusPayloadTooLarge, StatusTooManyRequests, StatusInternalServerError, StatusNotImplemented, StatusBadGateway, StatusServiceUnavailable, StatusGatewayTimeout:
+	case StatusOk, StatusBadRequest, StatusNotFound, StatusRequestTimeout, StatusLengthRequired, StatusPayloadTooLarge, StatusRequestHeaderTooLarge, StatusTooManyRequests, StatusInternalServerError, StatusNotImplemented, StatusBadGateway, StatusServiceUnavailable, StatusGatewayTimeout:
 		return true
 	default:
 		return false
@@ -279,103 +328,15 @@ func (s *HTTPServer) handleConnections() {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			fmt.Printf("Error with connection from %s\n", conn.RemoteAddr().String())
+			fmt.Printf("Error accepting connection: %s\n", err)
 			continue
 		}
 		fmt.Printf("🔥 Yui handling Connection from %s\n", conn.RemoteAddr().String())
-		go handleConn(conn)
+		go handleConn(conn, s.config)
 	}
 }
 
-func readHeader(conn net.Conn, data *[]byte, buff []byte) (int, error) {
-
-	for {
-		// Set a deadline for the connection to avoid hanging connections
-		n, err := conn.Read(buff)
-		if n > 0 {
-			*(data) = append(*(data), buff[:n]...)
-		}
-		if err != nil {
-			// Check if the error is a timeout error
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				writeErrorResponse(conn, "408")
-				fmt.Printf("Timeout reading from connection: %s\n", err)
-				return -1, err
-			}
-
-			// Client closed the connection; process whatever data we have
-			if errors.Is(err, io.EOF) {
-				return -1, err
-			}
-
-			// For other errors, send a 400 Bad Request response
-			writeErrorResponse(conn, "400")
-			fmt.Printf("Error reading from connection: %s\n", err)
-			return -1, err
-		}
-
-		// Check if the accumulated data exceeds the maximum header size
-		if len(*data) > max_header_size {
-			writeErrorResponse(conn, "413")
-			fmt.Printf("Header too large from %s\n", conn.RemoteAddr().String())
-			return -1, errors.New("header too large")
-		}
-
-		// Check if we have received the end of the header section
-		if idx := strings.Index(string(*data), CRLF+CRLF); idx != -1 {
-			return idx + len(CRLF+CRLF), nil
-		}
-	}
-}
-
-func readBody(conn net.Conn, data *[]byte, buff []byte, headerIdx int, contentLength int) (int, error) {
-
-	// A negative Content-Length is malformed; guard before it reaches a slice bound
-	if contentLength < 0 {
-		writeErrorResponse(conn, "400")
-		fmt.Printf("Negative Content-Length from %s\n", conn.RemoteAddr().String())
-		return -1, errors.New("negative content-length")
-	}
-
-	// Check if the declared body exceeds the maximum body size
-	if contentLength > max_body_size {
-		writeErrorResponse(conn, "413")
-		fmt.Printf("Body too large from %s\n", conn.RemoteAddr().String())
-		return -1, errors.New("body too large")
-	}
-
-	// readHeader may have already buffered part (or all) of the body
-	for len(*data)-headerIdx < contentLength {
-		n, err := conn.Read(buff)
-		if n > 0 {
-			*(data) = append(*(data), buff[:n]...)
-		}
-		if err != nil {
-			// Check if the error is a timeout error
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				writeErrorResponse(conn, "408")
-				fmt.Printf("Timeout reading from connection: %s\n", err)
-				return -1, err
-			}
-
-			// Client closed before sending the body it promised
-			if errors.Is(err, io.EOF) {
-				writeErrorResponse(conn, "400")
-				fmt.Printf("Incomplete body from %s: got %d of %d bytes\n", conn.RemoteAddr().String(), len(*data)-headerIdx, contentLength)
-				return -1, errors.New("incomplete body")
-			}
-
-			// For other errors, send a 400 Bad Request response
-			writeErrorResponse(conn, "400")
-			fmt.Printf("Error reading from connection: %s\n", err)
-			return -1, err
-		}
-	}
-
-	return headerIdx + contentLength, nil
-}
-
-func handleConn(conn net.Conn) {
+func handleConn(conn net.Conn, config ServerConfig) {
 	defer conn.Close()
 
 	// On a TLS connection the handshake is lazy: Accept returns before it runs,
@@ -389,36 +350,28 @@ func handleConn(conn net.Conn) {
 		}
 	}
 
-	data := make([]byte, 0, max_payload_size) // Initialize a slice to hold the raw data
-	buff := make([]byte, max_chunk_size)      // 1 byte buffer
-
-	// if json header has connection: keep-alive, we should keep the connection open for a certain duration
-	conn.SetDeadline(time.Now().Add(max_conn_duration)) // Set a deadline for the connection
-
-	// Read the raw connection data and parse the header and body
-	headerIdx, err := readHeader(conn, &data, buff)
+	reader := newByteStreamReader(conn, config)
+	headerBytes, _, err := reader.readHeader()
 	if err != nil {
-		fmt.Printf("Error reading header from connection: %s\n", err)
+		handleReadError(conn, err, "header")
 		return
 	}
-	if headerIdx == -1 {
+
+	// Parse the header into a Request object.
+	req, err := ParseHeader(headerBytes)
+	if err != nil {
 		writeErrorResponse(conn, "400")
-		fmt.Printf("No header found in connection: %s\n", conn.RemoteAddr().String())
-		return
-	}
-
-	headerBuff := strings.TrimRight(string(data[:headerIdx]), CRLF)
-
-	// Create the Request Object
-	req := &Request{Headers: make(map[string]string), conn: &conn}
-	res := &Response{headers: make(map[string]string), conn: &conn}
-
-	err = MakeHeader(req, strings.Split(headerBuff, CRLF))
-	if err != nil {
 		fmt.Printf("Error making header: %s\n", err)
 		return
 	}
-	var bodyBuff []byte
+	req.conn = &conn
+	res := &Response{headers: make(map[string]string), conn: &conn}
+
+	if _, chunked := req.Headers["transfer-encoding"]; chunked {
+		writeErrorResponse(conn, "501")
+		fmt.Printf("Unsupported Transfer-Encoding from %s\n", conn.RemoteAddr().String())
+		return
+	}
 
 	contentLengthString, ok := req.Headers["content-length"]
 
@@ -430,16 +383,15 @@ func handleConn(conn net.Conn) {
 			return
 		}
 
-		// Read the body and parse it onto the Request
-		bodyIdx, err := readBody(conn, &data, buff, headerIdx, contentLength)
+		bodyBytes, err := reader.readBody(contentLength)
 		if err != nil {
+			handleReadError(conn, err, "body")
 			fmt.Printf("Error reading body from connection: %s\n", err)
 			return
 		}
-
-		bodyBuff = data[headerIdx:bodyIdx]
-		ParseBody(req, string(bodyBuff))
+		ParseBody(req, string(bodyBytes))
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 
 	// Handle the request by looking up the appropriate handler in the HandlerMap
 	key := strings.ToLower(req.method) + ":" + req.Path
@@ -450,4 +402,27 @@ func handleConn(conn net.Conn) {
 		fmt.Printf("Error could not resolve path: %s\n", req.Path)
 		return
 	}
+}
+
+func handleReadError(conn net.Conn, err error, phase string) {
+	switch {
+	case errors.Is(err, errHeaderTooLarge):
+		writeErrorResponse(conn, "431")
+	case errors.Is(err, errBodyTooLarge):
+		writeErrorResponse(conn, "413")
+	case errors.Is(err, errInvalidBodyLen):
+		writeErrorResponse(conn, "400")
+	case errors.Is(err, errIncompleteBody):
+		writeErrorResponse(conn, "400")
+	case isTimeoutError(err):
+		writeErrorResponse(conn, "408")
+	default:
+		writeErrorResponse(conn, "400")
+	}
+	fmt.Printf("Error reading %s from connection: %s\n", phase, err)
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
