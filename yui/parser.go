@@ -139,6 +139,15 @@ func MakeHeader(req *Request, header []string) error {
 	return nil
 }
 
+func ParseHeader(header []byte) (*Request, error) {
+	raw := strings.TrimSuffix(string(header), CRLF+CRLF)
+	req := &Request{Headers: make(map[string]string)}
+	if err := MakeHeader(req, strings.Split(raw, CRLF)); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
 func ParseBody(req *Request, body string) {
 	if !Empty(body) {
 		req.Body = body

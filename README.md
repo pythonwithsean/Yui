@@ -10,8 +10,9 @@ An HTTP/1.1 server written from scratch in Go, on top of raw TCP sockets. No `ne
 - Reads the request byte by byte until `\r\n\r\n`, then reads exactly `Content-Length` bytes of body
 - Parses and validates the request line (method, path, version) and header fields
 - Rejects control characters and non-ASCII bytes in headers, which blocks CRLF/header injection
-- Enforces limits: 8KB of headers, 1MB of body, a 30 second connection deadline
-- Returns proper error responses: `400`, `404`, `408`, `413`
+- Enforces limits: 8KB of headers, 1MB of body, and default header/body/idle read timeouts
+- Supports configurable maximum header/body sizes plus header, body and idle read timeouts
+- Returns proper error responses: `400`, `404`, `408`, `413`, `431`
 - Routes `GET`, `POST`, `PUT` and `DELETE` by method and path to user-defined handlers
 - Builds responses with a chainable API (`Status`, `SetHeader`, `Send`) and sets `Content-Length` for you
 - Serves HTTPS through `ListenAndServeTLS` (TLS 1.2+, ALPN pinned to `http/1.1`)
@@ -21,10 +22,20 @@ An HTTP/1.1 server written from scratch in Go, on top of raw TCP sockets. No `ne
 ```go
 package main
 
-import "github.com/pythonwithsean/Yui/yui"
+import (
+	"time"
+
+	"github.com/pythonwithsean/Yui/yui"
+)
 
 func main() {
-	s := yui.NewServer()
+	s := yui.NewServer(yui.ServerConfig{
+		MaxHeaderSize: 8 * 1024,
+		MaxBodySize:   1 * 1024 * 1024,
+		HeaderTimeout: 10 * time.Second,
+		BodyTimeout:   30 * time.Second,
+		IdleTimeout:   5 * time.Second,
+	})
 
 	s.Get("/", func(req *yui.Request, res *yui.Response) {
 		res.SetHeader("Content-Type", "text/html")
@@ -39,6 +50,10 @@ func main() {
 	// or: s.ListenAndServeTLS("localhost", ":8443", "cert.pem", "key.pem")
 }
 ```
+
+`NewServer()` can still be called without arguments to use the defaults. A
+request without `Content-Length` is treated as having no body. Chunked request
+bodies are not implemented and receive `501 Not Implemented`.
 
 ```bash
 make run     # hot reload with air
@@ -66,7 +81,9 @@ notes.md           Go notes and the header-injection write-up
 
 ### HTTP
 - A message is a start line, header lines, a blank line, and an optional body. Every line ends in `\r\n`.
-- The body has no terminator. `Content-Length` is the only thing telling you where it ends, so a missing, negative or non-numeric value has to be rejected.
+- TCP is still one continuous byte stream: it may split or combine data on any `Read`. `Content-Length: 5` means the server must keep reading until it has exactly five body bytes, regardless of how many TCP reads that takes.
+- `Transfer-Encoding: chunked` does not create TCP-level messages. It writes each chunk's size and boundaries into the HTTP byte stream (for example, `5\r\nhello\r\n0\r\n\r\n`), and an HTTP parser reconstructs the logical chunks from those bytes.
+- For simplicity, Yui deliberately supports only `Content-Length`. A missing `Content-Length` means no request body, an invalid length is rejected, and any `Transfer-Encoding` receives `501 Not Implemented`.
 - Headers are untrusted input. A raw `\r\n` inside a header value lets an attacker inject new headers, so validation happens at the byte level (`0x21`–`0x7E` plus space and tab).
 - Reading the RFCs means reading ABNF. `notes.md` has the cheat sheet.
 
@@ -85,9 +102,8 @@ notes.md           Go notes and the header-injection write-up
 
 These are the parts I chose not to build. Each one would be the next step if I came back to this.
 
-- **No keep-alive.** Every connection serves exactly one request and then closes.
 - **No chunked transfer encoding.** Request bodies must use `Content-Length`.
-- **Reads one byte per syscall.** Simple to reason about, slow in practice.
+- **No keep-alive.** Every connection serves exactly one request and then closes.
 - **Lowercases the path and every header value**, so `/Users` and `/users` are the same route and header values lose their case.
 - **Duplicate headers overwrite each other** instead of being kept as a list.
 - **Exact-match routing only.** No path parameters, query-string parsing or middleware.
